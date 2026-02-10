@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import math
+import scipy.signal as signal
 
 
 class FusionMetrics:
@@ -9,19 +10,29 @@ class FusionMetrics:
         self.device = device
 
     def _normalize(self, img):
-        """将图像归一化到 0-255 范围 (用于计算指标)"""
+        """
+        将图像从 [0, 1] 线性映射到 [0, 255]
+        假设输入 img 已经是归一化好的 tensor 或 numpy 数组
+        """
         if torch.is_tensor(img):
             img = img.detach().cpu().numpy()
-        # 假设输入是 [B, C, H, W] 或 [H, W]
+
+        # 处理维度: [B, C, H, W] -> [H, W]
         if img.ndim == 4:
             img = img[0, 0, :, :]
         elif img.ndim == 3:
             img = img[0, :, :]
 
         img = img.astype(np.float32)
-        min_val, max_val = img.min(), img.max()
-        if max_val - min_val > 0:
-            img = (img - min_val) / (max_val - min_val) * 255.0
+
+        # 【关键修改】直接乘以 255，不要减去 min_val
+        # 这样保留了图像原本的明暗关系和对比度
+        img = img * 255.0
+
+        # 防止精度溢出（虽然理论上不会超过 255）
+        img[img > 255] = 255
+        img[img < 0] = 0
+
         return img
 
     def EN(self, fused):
@@ -46,17 +57,77 @@ class FusionMetrics:
         CF = np.sqrt(np.mean(CF ** 2))
         return np.sqrt(RF ** 2 + CF ** 2)
 
-    def AG(self, fused):
-        """平均梯度 (Average Gradient)"""
-        img = self._normalize(fused)
-        grad_x = np.diff(img, axis=1)
-        grad_y = np.diff(img, axis=0)
-        # 对齐尺寸
-        w = min(grad_x.shape[1], grad_y.shape[1])
-        h = min(grad_x.shape[0], grad_y.shape[0])
-        grad_x = grad_x[:h, :w]
-        grad_y = grad_y[:h, :w]
-        return np.mean(np.sqrt((grad_x ** 2 + grad_y ** 2) / 2))
+    def VIF(self, fused, img_a, img_b):
+        """
+        视觉信息保真度 (Visual Information Fidelity, VIF)
+        使用 Pixel-domain VIF (VIFp) 实现
+        VIF = VIF(Fused, A) + VIF(Fused, B)
+        """
+        f = self._normalize(fused)
+        a = self._normalize(img_a)
+        b = self._normalize(img_b)
+
+        def vif_single(ref, dist):
+            sigma_nsq = 2.0
+            eps = 1e-10
+
+            num = 0.0
+            den = 0.0
+
+            # 使用高斯核计算局部统计量
+            sigma = 2.0
+            # 窗口大小
+            win_size = int(6 * sigma + 1)
+            if win_size % 2 == 0: win_size += 1
+
+            # 创建高斯核
+            k1d = signal.gaussian(win_size, std=sigma).reshape(win_size, 1)
+            window = np.outer(k1d, k1d)
+            window /= np.sum(window)
+
+            # 计算均值
+            mu1 = signal.convolve2d(ref, window, mode='valid')
+            mu2 = signal.convolve2d(dist, window, mode='valid')
+
+            mu1_sq = mu1 * mu1
+            mu2_sq = mu2 * mu2
+            mu1_mu2 = mu1 * mu2
+
+            # 计算方差和协方差
+            sigma1_sq = signal.convolve2d(ref * ref, window, mode='valid') - mu1_sq
+            sigma2_sq = signal.convolve2d(dist * dist, window, mode='valid') - mu2_sq
+            sigma12 = signal.convolve2d(ref * dist, window, mode='valid') - mu1_mu2
+
+            # 数值保护
+            sigma1_sq[sigma1_sq < 0] = 0
+            sigma2_sq[sigma2_sq < 0] = 0
+
+            # 估计增益因子 g
+            g = sigma12 / (sigma1_sq + eps)
+
+            # 估计噪声方差 sv_sq
+            sv_sq = sigma2_sq - g * sigma12
+
+            g[sigma1_sq < eps] = 0
+            sv_sq[sigma1_sq < eps] = sigma2_sq[sigma1_sq < eps]
+            sigma1_sq[sigma1_sq < eps] = 0
+
+            g[sigma1_sq < eps] = 0
+            sv_sq[sigma1_sq < eps] = 0
+
+            sv_sq[sv_sq < eps] = eps
+
+            # 计算 VIF
+            # 分子: 失真图像的信息量
+            num += np.sum(np.log10(1 + g ** 2 * sigma1_sq / (sv_sq + sigma_nsq)))
+            # 分母: 参考图像的信息量
+            den += np.sum(np.log10(1 + sigma1_sq / sigma_nsq))
+
+            if den == 0: return 0
+            return num / den
+
+        # 计算融合图像相对于两幅源图像的 VIF 之和
+        return vif_single(a, f) + vif_single(b, f)
 
     def MI(self, fused, img_a, img_b):
         """互信息 (Mutual Information) - MI(F,A) + MI(F,B)"""
@@ -92,19 +163,28 @@ class FusionMetrics:
             if den == 0: return 0
             return num / den
 
-        return correlation(diff_a, a) + correlation(diff_b, b)
+        return correlation(diff_a, b) + correlation(diff_b, a)
 
     def Qabf(self, fused, img_a, img_b):
         """
-        Qabf (Edge Preservation Index) - Xydeas & Petrovic (2000)
-        这是最复杂但也最受认可的指标。
+        Qabf (Edge Preservation Index) - 最终融合修正版
         """
-        f = self._normalize(fused)
-        a = self._normalize(img_a)
-        b = self._normalize(img_b)
 
-        # Sobel算子参数
-        import scipy.signal as signal
+        # 【关键修正】：不要使用 min-max 动态拉伸，而是统一线性缩放
+        # 假设输入是 [0, 1] 的 tensor 或 numpy
+        def safe_scale(img):
+            if torch.is_tensor(img):
+                img = img.detach().cpu().numpy()
+            if img.ndim == 4:
+                img = img[0, 0]
+            elif img.ndim == 3:
+                img = img[0]
+            # 这里的 255.0 是为了让梯度数值在常见范围内，不改变对比度
+            return img.astype(np.float32) * 255.0
+
+        f = safe_scale(fused)
+        a = safe_scale(img_a)
+        b = safe_scale(img_b)
 
         # 定义 Sobel 核
         sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
@@ -114,69 +194,51 @@ class FusionMetrics:
             gx = signal.convolve2d(img, sobel_x, mode='same')
             gy = signal.convolve2d(img, sobel_y, mode='same')
             g_strength = np.sqrt(gx ** 2 + gy ** 2)
-            g_alpha = np.arctan2(gy, gx)  # 角度
+            g_alpha = np.arctan2(gy, gx)  # 角度 [-pi, pi]
             return g_strength, g_alpha
 
         g_a, alpha_a = get_gradient(a)
         g_b, alpha_b = get_gradient(b)
         g_f, alpha_f = get_gradient(f)
 
-        # Qabf 参数 (来源于原始论文)
+        # Qabf 标准参数 (Xydeas & Petrovic 2000)
         L, Tg, kg, Dg, Ta, ka, Da = 1, 0.9994, -15, 0.5, 0.9879, -22, 0.8
 
-        def sigmoid(x, T, k, D):
-            return D + (1 - D) / (1 + np.exp(-k * (x - T)))  # 论文公式修正
-            # 通常简化实现: Q = Gamma / (1 + exp(k*(x-T)))
-            # 这里使用标准 Qabf 实现库中的逻辑
-
         def edge_preservation(g1, a1, g2, a2):
-            # 强度保留 Qg
-            # Qg = Tg / (1 + exp(kg * (G1 - G2) / (max(G1, G2) + eps)))
-            # 简化版逻辑，参考常用 Matlab 代码转译:
-
-            # 1. 强度因子 Qg
-            val_g = np.zeros_like(g1)
-            mask = (g1 == 0) & (g2 == 0)
-            # 避免除0
+            # --- 1. 强度保留值 Qg ---
             denom = np.maximum(g1, g2)
-            # 防止极小值
             denom[denom == 0] = 1e-6
+            # 使用 min/max 计算比率 (0~1)
+            G_sim = np.minimum(g1, g2) / denom
+            Qg = Tg / (1 + np.exp(kg * (G_sim - Dg)))
 
-            # 这种实现方式比较复杂，我们使用一种更稳定的标准计算方式
-            # 来源: "Objective video quality assessment methods..."
-
-            # 强度相似度
-            Qg = Tg / (1 + np.exp(kg * (np.abs(g1 - g2) / denom - Dg)))
-
-            # 角度相似度
+            # --- 2. 角度保留值 Qa ---
             diff_alpha = np.abs(a1 - a2)
-            # 归一化到 0-pi
             diff_alpha = np.mod(diff_alpha, 2 * np.pi)
             diff_alpha[diff_alpha > np.pi] = 2 * np.pi - diff_alpha[diff_alpha > np.pi]
 
-            Qa = Ta / (1 + np.exp(ka * (diff_alpha / (np.pi / 2) - Da)))
+            # 将角度差异转化为相似度 (0~1)
+            A_sim = 1 - diff_alpha / (np.pi / 2)
+            A_sim[A_sim < 0] = 0
+            Qa = Ta / (1 + np.exp(ka * (A_sim - Da)))
 
             return Qg * Qa
 
         Q_af = edge_preservation(g_a, alpha_a, g_f, alpha_f)
         Q_bf = edge_preservation(g_b, alpha_b, g_f, alpha_f)
 
-        # 权重 (通常使用较大的梯度值作为权重)
+        # 权重
         w_a = g_a ** L
         w_b = g_b ** L
         sum_w = w_a + w_b
-
-        # 避免分母为0
         sum_w[sum_w == 0] = 1e-6
 
         numerator = Q_af * w_a + Q_bf * w_b
         Q = np.sum(numerator) / np.sum(sum_w)
         return Q
 
-    def MS_SSIM(self, fused, img_a, img_b):
+    def Avg_SSIM(self, fused, img_a, img_b):
         """结构相似性 (仅调用你之前的 pytorch 实现)"""
-        # 注意：这里我们简单复用你之前的 loss.py 里的逻辑，或者使用 skimage
-        # 为了不依赖库，我们用一个简化版 (A+B)/2 的 SSIM
         from utils.loss import SSIM
         ssim_tool = SSIM(window_size=11, channel=1).to(self.device)
 

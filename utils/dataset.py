@@ -46,9 +46,13 @@ class FusionDataset(Dataset):
         try:
             mri_img = Image.open(mri_path)
             ct_img = Image.open(ct_path)
-        except FileNotFoundError:
-            print(f"Warning: Missing pair for {file_name}, using first image instead.")
-            return self.__getitem__(0)
+        except Exception as e:  # 捕获所有异常，不仅仅是 FileNotFoundError
+            print(f"⚠️ Error loading {file_name}: {e}")
+            # 策略：尝试下一张，如果转了一圈都不行就报错
+            new_index = (index + 1) % len(self.file_list)
+            if new_index == index:  # 数据集里只有一张图且坏了
+                raise e
+            return self.__getitem__(new_index)
 
         # 应用预处理
         mri_tensor = self.transform(mri_img)

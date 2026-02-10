@@ -42,7 +42,8 @@ def train():
         device=cfg.device,
         int_w=cfg.lambda_int,
         grad_w=cfg.lambda_grad,
-        ssim_w=cfg.lambda_ssim
+        ssim_w=cfg.lambda_ssim,
+        freq_w=cfg.lambda_freq
     )
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-4)
 
@@ -52,39 +53,50 @@ def train():
     # [优化] 3. 初始化混合精度 Scaler
     scaler = GradScaler()
 
+    # [新增] 定义累积步数：4 相当于 BatchSize 变成 1x4 = 4
+    accumulation_steps = 4
+
     # 4. 训练循环
     model.train()
     for epoch in range(cfg.num_epochs):
         epoch_loss = 0.0
 
-        # =================================================================================
-        # [核心修改] 进度条配置
-        # leave=False: 跑完一轮后进度条自动消失，不占用屏幕空间
-        # file=sys.stdout: 强制输出到标准流，防止 PyCharm 刷屏
-        # ncols=100: 固定宽度，防止自动换行
-        # =================================================================================
+        # 在每轮开始前清空梯度
+        optimizer.zero_grad()
+
         with tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg.num_epochs}", file=sys.stdout, ncols=100,
                   leave=False) as progress_bar:
             for i, (img_a, img_b, _) in enumerate(progress_bar):
                 img_a = img_a.to(cfg.device)
                 img_b = img_b.to(cfg.device)
 
-                optimizer.zero_grad()
-
-                # [优化] 4. 开启混合精度上下文
+                # 开启混合精度上下文
                 with autocast():
                     fused_img = model(img_a, img_b)
                     loss = criterion(fused_img, img_a, img_b)
 
-                # [优化] 5. 反向传播
+                    # [关键修改 1] Loss 归一化：因为我们要累积 4 次，所以每次 loss 要除以 4
+                    loss = loss / accumulation_steps
+
+                # [关键修改 2] 反向传播 (只算梯度，不更新参数)
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
 
-                epoch_loss += loss.item()
+                # [关键修改 3] 每积累 4 个 batch，才真正更新一次参数
+                if (i + 1) % accumulation_steps == 0:
+                    # 梯度裁剪
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
 
-                # 更新进度条上的瞬时 Loss
-                progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+                    # 更新参数
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    # 清空梯度
+                    optimizer.zero_grad()
+
+                # 记录 Loss (记得乘回来以便观察)
+                epoch_loss += loss.item() * accumulation_steps
+                progress_bar.set_postfix({'loss': f"{loss.item() * accumulation_steps:.4f}"})
 
         # =================================================================================
         # 退出 with 循环后，进度条自动清除。
@@ -95,7 +107,8 @@ def train():
         avg_loss = epoch_loss / len(train_loader)
 
         # 2. 获取当前学习率
-        current_lr = optimizer.param_groups[0]['lr']
+        lr_ = optimizer.param_groups[0]['lr']
+        current_lr = lr_
 
         # 3. 打印整齐的日志
         print(f"Epoch [{epoch + 1}/{cfg.num_epochs}] Average Loss: {avg_loss:.6f} | LR: {current_lr:.2e}")
@@ -107,7 +120,7 @@ def train():
         if (epoch + 1) % 10 == 0 or (epoch + 1) == cfg.num_epochs:
             save_path = os.path.join(cfg.CHECKPOINT_DIR, f"cwaf_epoch_{epoch + 1}.pth")
             torch.save(model.state_dict(), save_path)
-            # print(f" Model saved to {save_path}") # 可选：为了保持清爽，可以注释掉这行
+            print(f" Model saved to {save_path}")
 
     print("Training Finished!")
 
